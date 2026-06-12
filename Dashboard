@@ -1,0 +1,311 @@
+import os
+import duckdb
+import pandas as pd
+import streamlit as st
+import pydeck as pdk
+import plotly.express as px
+import plotly.graph_objects as go
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page config
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Crime Intelligence Dashboard",
+    page_icon="icon",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+DB_PATH = "./data_lake/warehouse/crime_intelligence.duckdb"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Styling
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+.main { background: #0a0e1a; }
+section[data-testid="stSidebar"] { background: #0f1629 !important; }
+
+.kpi-card {
+    background: linear-gradient(135deg, #1a2540 0%, #0f1629 100%);
+    border: 1px solid rgba(99, 179, 237, 0.2);
+    border-radius: 16px;
+    padding: 24px 20px;
+    text-align: center;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.4);
+    transition: transform 0.2s;
+}
+.kpi-card:hover { transform: translateY(-2px); }
+.kpi-label { color: #7f9ab5; font-size: 13px; font-weight: 500; letter-spacing: 0.8px; text-transform: uppercase; margin-bottom: 8px; }
+.kpi-value { color: #63b3ed; font-size: 36px; font-weight: 700; line-height: 1.1; }
+.kpi-sub   { color: #4a6785; font-size: 12px; margin-top: 6px; }
+
+.section-title {
+    color: #e2e8f0;
+    font-size: 18px;
+    font-weight: 600;
+    border-left: 3px solid #63b3ed;
+    padding-left: 12px;
+    margin: 28px 0 16px 0;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DB connection (cached)
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_con():
+    if not os.path.exists(DB_PATH):
+        st.error(f"Warehouse not found at `{DB_PATH}`. Run `hive_warehouse.py` first.")
+        st.stop()
+    return duckdb.connect(DB_PATH, read_only=True)
+
+@st.cache_data(ttl=300)
+def query(sql: str) -> pd.DataFrame:
+    return get_con().execute(sql).fetchdf()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar — filters
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("##  Crime Intelligence")
+    st.markdown("---")
+
+    months = query("SELECT DISTINCT month FROM dim_date ORDER BY month")["month"].tolist()
+    sel_month = st.selectbox(" Month", ["All"] + months)
+
+    groups = query("SELECT DISTINCT category_group FROM dim_category ORDER BY 1")["category_group"].tolist()
+    sel_group = st.multiselect(" Crime Group", groups, default=groups)
+
+    top_n = st.slider("Top N Streets (Hotspot Map)", 5, 50, 20)
+
+    st.markdown("---")
+    st.markdown("**Pipeline Layers**")
+    st.markdown(" Bronze →  Silver →Gold →DuckDB")
+
+# ── Build WHERE clause from sidebar ─────────────────────────────────────────
+month_filter = f"AND dd.month = '{sel_month}'" if sel_month != "All" else ""
+group_list   = ", ".join([f"'{g}'" for g in sel_group]) if sel_group else "''"
+group_filter = f"AND dc.category_group IN ({group_list})"
+
+BASE_JOINS = """
+    FROM   fact_crimes f
+    JOIN   dim_date     dd ON f.date_key     = dd.date_key
+    JOIN   dim_category dc ON f.category_key = dc.category_key
+    JOIN   dim_outcome  dout ON f.outcome_key  = dout.outcome_key
+    JOIN   dim_location dl ON f.location_key = dl.location_key
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Header
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<h1 style='color:#e2e8f0; font-size:28px; font-weight:700; margin-bottom:4px;'>
+  🔍 Crime Intelligence Dashboard
+</h1>
+<p style='color:#7f9ab5; font-size:14px; margin-bottom:28px;'>
+  UK Police API · Medallion Architecture · DuckDB Star Schema
+</p>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KPI Row
+# ─────────────────────────────────────────────────────────────────────────────
+kpi_df = query(f"""
+    SELECT
+        SUM(f.crime_count)                             AS total_crimes,
+        ROUND(AVG(f.is_resolved::INTEGER) * 100, 1)   AS resolution_rate,
+        COUNT(DISTINCT dl.street_name)                 AS unique_streets,
+        COUNT(DISTINCT dc.category_slug)               AS crime_types
+    {BASE_JOINS}
+    WHERE 1=1 {month_filter} {group_filter}
+""")
+
+c1, c2, c3, c4 = st.columns(4)
+
+def kpi_html(label, value, sub=""):
+    return f"""
+    <div class="kpi-card">
+      <div class="kpi-label">{label}</div>
+      <div class="kpi-value">{value}</div>
+      <div class="kpi-sub">{sub}</div>
+    </div>"""
+
+with c1:
+    st.markdown(kpi_html("Total Crimes", f"{int(kpi_df['total_crimes'][0]):,}", "recorded incidents"), unsafe_allow_html=True)
+with c2:
+    st.markdown(kpi_html("Resolution Rate", f"{kpi_df['resolution_rate'][0]}%", "cases with outcome"), unsafe_allow_html=True)
+with c3:
+    st.markdown(kpi_html("Unique Streets", f"{int(kpi_df['unique_streets'][0]):,}", "locations affected"), unsafe_allow_html=True)
+with c4:
+    st.markdown(kpi_html("Crime Types", f"{int(kpi_df['crime_types'][0])}", "distinct categories"), unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Row 2 — Category bar + Outcome donut
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<div class="section-title">Crime Breakdown</div>', unsafe_allow_html=True)
+col_bar, col_donut = st.columns([3, 2])
+
+with col_bar:
+    cat_df = query(f"""
+        SELECT dc.category_label, dc.category_group,
+               SUM(f.crime_count)                           AS total,
+               ROUND(AVG(f.is_resolved::INTEGER)*100,1)    AS resolution_pct
+        {BASE_JOINS}
+        WHERE 1=1 {month_filter} {group_filter}
+        GROUP BY dc.category_label, dc.category_group
+        ORDER BY total DESC
+    """)
+    color_map = {
+        "Property Crime": "#63b3ed",
+        "Violent Crime":  "#fc8181",
+        "Public Order":   "#f6ad55",
+        "Other":          "#9f7aea",
+    }
+    cat_df["color"] = cat_df["category_group"].map(color_map).fillna("#a0aec0")
+
+    fig_bar = px.bar(
+        cat_df, x="total", y="category_label", orientation="h",
+        color="category_group",
+        color_discrete_map=color_map,
+        labels={"total": "Crimes", "category_label": ""},
+        title="Crimes by Category",
+        custom_data=["resolution_pct"],
+    )
+    fig_bar.update_traces(
+        hovertemplate="<b>%{y}</b><br>Crimes: %{x:,}<br>Resolution: %{customdata[0]}%<extra></extra>"
+    )
+    fig_bar.update_layout(
+        plot_bgcolor="#0f1629", paper_bgcolor="#0f1629",
+        font_color="#a0aec0", title_font_color="#e2e8f0",
+        legend=dict(bgcolor="#0f1629", font_color="#a0aec0"),
+        yaxis=dict(autorange="reversed"),
+        height=380,
+    )
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+with col_donut:
+    out_df = query(f"""
+        SELECT dout.outcome_category, SUM(f.crime_count) AS total
+        {BASE_JOINS}
+        WHERE 1=1 {month_filter} {group_filter}
+        GROUP BY dout.outcome_category
+        ORDER BY total DESC
+    """)
+    fig_donut = go.Figure(go.Pie(
+        labels=out_df["outcome_category"],
+        values=out_df["total"],
+        hole=0.55,
+        marker=dict(colors=px.colors.sequential.Blues_r[:len(out_df)]),
+        textinfo="percent",
+        hovertemplate="<b>%{label}</b><br>%{value:,} crimes (%{percent})<extra></extra>",
+    ))
+    fig_donut.update_layout(
+        title="Outcome Distribution",
+        plot_bgcolor="#0f1629", paper_bgcolor="#0f1629",
+        font_color="#a0aec0", title_font_color="#e2e8f0",
+        legend=dict(bgcolor="#0f1629", font_color="#a0aec0", font_size=10),
+        height=380,
+    )
+    st.plotly_chart(fig_donut, use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Row 3 — Hotspot Map + Hotspot table
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<div class="section-title">Crime Hotspot Map</div>', unsafe_allow_html=True)
+
+map_df = query(f"""
+    SELECT dl.street_name, dl.latitude, dl.longitude,
+           SUM(f.crime_count) AS total_crimes,
+           dl.hotspot_rank
+    {BASE_JOINS}
+    WHERE dl.latitude IS NOT NULL
+      AND dl.longitude IS NOT NULL
+      {month_filter} {group_filter}
+    GROUP BY dl.street_name, dl.latitude, dl.longitude, dl.hotspot_rank
+    ORDER BY total_crimes DESC
+    LIMIT {top_n}
+""")
+
+col_map, col_table = st.columns([3, 2])
+
+with col_map:
+    if not map_df.empty:
+        map_df["radius"]   = (map_df["total_crimes"] / map_df["total_crimes"].max() * 120 + 20).astype(int)
+        map_df["color_r"]  = 99
+        map_df["color_g"]  = 179
+        map_df["color_b"]  = 237
+
+        layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=map_df,
+            get_position=["longitude", "latitude"],
+            get_radius="radius",
+            get_fill_color=["color_r", "color_g", "color_b", 180],
+            pickable=True,
+        )
+        view = pdk.ViewState(
+            latitude=map_df["latitude"].mean(),
+            longitude=map_df["longitude"].mean(),
+            zoom=13, pitch=40,
+        )
+        st.pydeck_chart(pdk.Deck(
+            layers=[layer], initial_view_state=view,
+            map_style="mapbox://styles/mapbox/dark-v10",
+            tooltip={"text": "{street_name}\nCrimes: {total_crimes}\nRank: #{hotspot_rank}"},
+        ))
+    else:
+        st.info("No map data available for the current filters.")
+
+with col_table:
+    st.markdown("**Top Hotspot Streets**")
+    display = map_df[["hotspot_rank", "street_name", "total_crimes"]].rename(columns={
+        "hotspot_rank": "Rank", "street_name": "Street", "total_crimes": "Crimes"
+    })
+    st.dataframe(display, use_container_width=True, hide_index=True, height=360)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Row 4 — Category × Month heatmap
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown('<div class="section-title">Category × Month Heatmap</div>', unsafe_allow_html=True)
+
+hm_df = query(f"""
+    SELECT dd.month, dc.category_label, SUM(f.crime_count) AS total
+    {BASE_JOINS}
+    WHERE 1=1 {group_filter}
+    GROUP BY dd.month, dc.category_label
+    ORDER BY dd.month, total DESC
+""")
+
+if not hm_df.empty:
+    pivot = hm_df.pivot(index="category_label", columns="month", values="total").fillna(0)
+    fig_hm = go.Figure(go.Heatmap(
+        z=pivot.values.tolist(),
+        x=pivot.columns.tolist(),
+        y=pivot.index.tolist(),
+        colorscale="Blues",
+        hovertemplate="<b>%{y}</b><br>Month: %{x}<br>Crimes: %{z:,}<extra></extra>",
+    ))
+    fig_hm.update_layout(
+        plot_bgcolor="#0f1629", paper_bgcolor="#0f1629",
+        font_color="#a0aec0", height=360,
+        xaxis=dict(title=""),
+        yaxis=dict(title=""),
+    )
+    st.plotly_chart(fig_hm, use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Footer
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.markdown(
+    "<p style='color:#4a6785; font-size:12px; text-align:center;'>"
+    "Crime Intelligence Pipeline · Bronze → Silver → Gold → DuckDB Star Schema · Streamlit Dashboard"
+    "</p>",
+    unsafe_allow_html=True,
+)
