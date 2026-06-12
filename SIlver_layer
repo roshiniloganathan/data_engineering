@@ -1,0 +1,283 @@
+import os
+import json
+import logging
+import hashlib
+from datetime import datetime, timezone
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("SilverTransformation")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Explicit PyArrow Schema for the Silver Parquet Table
+# ─────────────────────────────────────────────────────────────────────────────
+SILVER_SCHEMA = pa.schema([
+    pa.field("crime_id",                  pa.int64(),    nullable=True),
+    pa.field("persistent_id",             pa.string(),   nullable=True),
+    pa.field("category",                  pa.string(),   nullable=False),
+    pa.field("location_type",             pa.string(),   nullable=True),
+    pa.field("month",                     pa.string(),   nullable=True),   # "YYYY-MM"
+    pa.field("context",                   pa.string(),   nullable=True),
+    pa.field("latitude",                  pa.float64(),  nullable=True),
+    pa.field("longitude",                 pa.float64(),  nullable=True),
+    pa.field("street_name",               pa.string(),   nullable=True),
+    pa.field("outcome_category",          pa.string(),   nullable=True),
+    pa.field("outcome_date",              pa.string(),   nullable=True),
+    pa.field("record_hash",               pa.string(),   nullable=True),   # SHA-256 for dedup
+    pa.field("bronze_ingestion_timestamp",pa.string(),   nullable=True),
+    pa.field("silver_processed_at",       pa.string(),   nullable=False),
+    pa.field("silver_version",            pa.string(),   nullable=False),
+    pa.field("partition_month",           pa.string(),   nullable=True),   # partition key
+])
+
+SILVER_VERSION = "1.0"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _hash_record(record: dict) -> str:
+    """Stable SHA-256 fingerprint for deduplication (ignores audit fields)."""
+    stable_keys = [
+        "crime_id", "persistent_id", "category", "location_type",
+        "month", "latitude", "longitude", "street_name",
+        "outcome_category", "outcome_date",
+    ]
+    payload = {k: record.get(k) for k in stable_keys}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def parse_bronze_record(raw_data_str: str, ingestion_ts: str, silver_ts: str) -> dict | None:
+    """
+    Parse a single JSON crime record from the Bronze layer.
+    Returns a flat dict aligned to SILVER_SCHEMA, or None on failure.
+    """
+    try:
+        data = json.loads(raw_data_str)
+
+        # Core fields
+        record = {
+            "crime_id":                   _safe_int(data.get("id")),
+            "persistent_id":              _safe_str(data.get("persistent_id")),
+            "category":                   _safe_str(data.get("category")),
+            "location_type":              _safe_str(data.get("location_type")),
+            "month":                      _safe_str(data.get("month")),
+            "context":                    _safe_str(data.get("context")),
+            "latitude":                   None,
+            "longitude":                  None,
+            "street_name":                None,
+            "outcome_category":           None,
+            "outcome_date":               None,
+            "record_hash":                None,
+            "bronze_ingestion_timestamp": ingestion_ts,
+            "silver_processed_at":        silver_ts,
+            "silver_version":             SILVER_VERSION,
+            "partition_month":            None,
+        }
+
+        # Flatten location
+        location = data.get("location") or {}
+        if location:
+            record["latitude"]    = _safe_float(location.get("latitude"))
+            record["longitude"]   = _safe_float(location.get("longitude"))
+            record["street_name"] = _safe_str((location.get("street") or {}).get("name"))
+
+        # Flatten outcome
+        outcome = data.get("outcome_status") or {}
+        if outcome:
+            record["outcome_category"] = _safe_str(outcome.get("category"))
+            record["outcome_date"]     = _safe_str(outcome.get("date"))
+
+        # Derive partition key from month field ("YYYY-MM")
+        record["partition_month"] = record["month"] if record["month"] else "unknown"
+
+        # Compute dedup hash
+        record["record_hash"] = _hash_record(record)
+
+        return record
+
+    except Exception as exc:
+        logger.warning(f"Failed to parse record: {exc}")
+        return None
+
+
+def _safe_int(val) -> int | None:
+    try:
+        return int(val) if val not in (None, "", "null") else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_float(val) -> float | None:
+    try:
+        return float(val) if val not in (None, "", "null") else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_str(val) -> str | None:
+    if val is None or str(val).strip() in ("", "null"):
+        return None
+    return str(val).strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    silver_ts = datetime.now(timezone.utc).isoformat()
+    logger.info("=" * 60)
+    logger.info("Silver Layer Transformation — START")
+    logger.info(f"Run timestamp : {silver_ts}")
+    logger.info(f"Schema version: {SILVER_VERSION}")
+    logger.info("=" * 60)
+
+    bronze_dir = "./data_lake/bronze/crime/"
+    silver_dir = "./data_lake/silver/crime/"
+
+    # ── Validate input ────────────────────────────────────────────────────────
+    if not os.path.exists(bronze_dir):
+        logger.error(f"Bronze directory not found: {bronze_dir}. Run bronze_layer.py first.")
+        return
+
+    bronze_files = [f for f in os.listdir(bronze_dir) if f.endswith(".json")]
+    if not bronze_files:
+        logger.warning("No JSON files found in Bronze layer. Nothing to process.")
+        return
+
+    logger.info(f"Found {len(bronze_files)} Bronze file(s) to process.")
+
+    # ── Read & parse Bronze records ───────────────────────────────────────────
+    all_records = []
+    parse_errors = 0
+
+    for filename in sorted(bronze_files):
+        file_path = os.path.join(bronze_dir, filename)
+        logger.info(f"  Reading: {file_path}")
+        file_errors = 0
+
+        with open(file_path, "r", encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    wrapper = json.loads(line)
+                    raw_data_str   = wrapper.get("raw_data")
+                    ingestion_ts   = wrapper.get("ingestion_timestamp", "")
+
+                    if not raw_data_str:
+                        file_errors += 1
+                        continue
+
+                    record = parse_bronze_record(raw_data_str, ingestion_ts, silver_ts)
+                    if record:
+                        all_records.append(record)
+                    else:
+                        file_errors += 1
+
+                except json.JSONDecodeError as exc:
+                    logger.debug(f"    Line {line_no} JSON error: {exc}")
+                    file_errors += 1
+
+        parse_errors += file_errors
+        logger.info(f"    → parsed {len(all_records)} total records so far ({file_errors} errors in this file)")
+
+    if not all_records:
+        logger.warning("No valid records parsed from Bronze layer. Aborting.")
+        return
+
+    # ── Build DataFrame ───────────────────────────────────────────────────────
+    df = pd.DataFrame(all_records)
+
+    # Cast columns explicitly for schema alignment
+    df["crime_id"]  = pd.to_numeric(df["crime_id"],  errors="coerce").astype("Int64")
+    df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+
+    logger.info(f"Total records ingested  : {len(df):,}")
+
+    # ── Data Quality — Drop critical nulls ────────────────────────────────────
+    before_null_drop = len(df)
+    df = df.dropna(subset=["category", "latitude", "longitude"])
+    null_dropped = before_null_drop - len(df)
+    logger.info(f"Dropped (null critical) : {null_dropped:,}")
+
+    # ── Data Quality — Deduplicate ────────────────────────────────────────────
+    before_dedup = len(df)
+
+    # Records with a crime_id: deduplicate on crime_id
+    mask_has_id  = df["crime_id"].notna()
+    df_with_id   = df[mask_has_id].drop_duplicates(subset=["crime_id"])
+
+    # Records without a crime_id (e.g., anti-social behaviour): deduplicate on hash
+    df_no_id     = df[~mask_has_id].drop_duplicates(subset=["record_hash"])
+
+    df_clean = pd.concat([df_with_id, df_no_id], ignore_index=True)
+    dedup_dropped = before_dedup - len(df_clean)
+    logger.info(f"Dropped (duplicates)    : {dedup_dropped:,}")
+    logger.info(f"Final clean record count: {len(df_clean):,}")
+
+    # ── Write Parquet Table ───────────────────────────────────────────────────
+    os.makedirs(silver_dir, exist_ok=True)
+
+    # Convert to PyArrow Table with explicit schema
+    try:
+        table = pa.Table.from_pandas(df_clean, schema=SILVER_SCHEMA, preserve_index=False)
+    except pa.ArrowInvalid as exc:
+        logger.error(f"Schema cast failed: {exc}")
+        # Fallback: let PyArrow infer schema
+        logger.warning("Falling back to inferred schema.")
+        table = pa.Table.from_pandas(df_clean, preserve_index=False)
+
+    # Write as a partitioned Parquet dataset (partitioned by month)
+    output_path = os.path.join(silver_dir, "crime_silver_table")
+    logger.info(f"Writing partitioned Parquet table to: {output_path}")
+
+    pq.write_to_dataset(
+        table,
+        root_path=output_path,
+        partition_cols=["partition_month"],
+        compression="snappy",                  # fast & space-efficient
+        existing_data_behavior="overwrite_or_ignore",
+    )
+
+    # ── Write _metadata sidecar ───────────────────────────────────────────────
+    metadata = {
+        "silver_version":      SILVER_VERSION,
+        "run_timestamp":       silver_ts,
+        "bronze_files":        bronze_files,
+        "total_bronze_rows":   len(all_records),
+        "null_dropped":        null_dropped,
+        "dedup_dropped":       dedup_dropped,
+        "parse_errors":        parse_errors,
+        "final_row_count":     len(df_clean),
+        "schema_fields":       [f.name for f in SILVER_SCHEMA],
+        "partitioned_by":      "partition_month",
+        "compression":         "snappy",
+    }
+    meta_path = os.path.join(silver_dir, "silver_run_metadata.json")
+    with open(meta_path, "w", encoding="utf-8") as mf:
+        json.dump(metadata, mf, indent=2)
+
+    logger.info("=" * 60)
+    logger.info("Silver Layer Transformation — COMPLETE")
+    logger.info(f"  Parquet table : {output_path}/")
+    logger.info(f"  Run metadata  : {meta_path}")
+    logger.info(f"  Final rows    : {len(df_clean):,}")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
