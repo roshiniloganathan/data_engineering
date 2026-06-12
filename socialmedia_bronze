@@ -1,0 +1,216 @@
+import os
+import json
+import time
+import logging
+import hashlib
+from datetime import datetime, timezone
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("SocialMediaBronze")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+SUBREDDITS      = ["london", "CrimeWatch", "policeuk"]
+SEARCH_TERMS    = ["crime", "police", "theft", "robbery", "assault", "burglary"]
+POST_LIMIT      = 100     # per subreddit search
+OUTPUT_DIR      = "./data_lake/bronze/social_media/"
+SOURCE_NAME     = "reddit"
+
+
+def fetch_reddit_posts(reddit, subreddit_name: str, search_term: str, limit: int) -> list:
+    """Search a subreddit for posts matching a crime-related keyword."""
+    posts = []
+    try:
+        subreddit = reddit.subreddit(subreddit_name)
+        for submission in subreddit.search(search_term, limit=limit, sort="new"):
+            posts.append({
+                "post_id":        submission.id,
+                "title":          submission.title,
+                "body":           submission.selftext[:2000] if submission.selftext else "",
+                "subreddit":      subreddit_name,
+                "search_term":    search_term,
+                "score":          submission.score,
+                "upvote_ratio":   submission.upvote_ratio,
+                "num_comments":   submission.num_comments,
+                "url":            submission.url,
+                "permalink":      f"https://reddit.com{submission.permalink}",
+                "author":         str(submission.author) if submission.author else "[deleted]",
+                "created_utc":    datetime.fromtimestamp(submission.created_utc, tz=timezone.utc).isoformat(),
+                "flair":          submission.link_flair_text,
+            })
+        logger.info(f"  r/{subreddit_name} [{search_term}] → {len(posts)} posts")
+    except Exception as exc:
+        logger.warning(f"  Failed r/{subreddit_name} [{search_term}]: {exc}")
+    return posts
+
+
+def generate_mock_reddit_posts(ingestion_ts: str) -> list:
+    """Generate high-quality mock Reddit posts with realistic UK crime discussions."""
+    import random
+    from datetime import datetime, timedelta, timezone
+    
+    mock_posts = []
+    
+    # Define templates by category / search term
+    templates = {
+        "theft": [
+            ("Phone snatched out of my hand near Oxford Circus", "Be careful everyone, two guys on an electric bike rode up on the pavement and grabbed it while I was texting.", "london", "Crime"),
+            ("Bicycle stolen from secure garage in Shoreditch", "They cut through a heavy chain lock. If anyone sees a red Specialized Allez for sale on Marketplace, let me know.", "london", "Stolen"),
+            ("Watch snatchers targeting people in Soho", "Just saw someone get their watch grabbed on Friday night. Highly organized, they spot you and signal to others down the street.", "london", "Warning"),
+            ("Shoplifting in local high street is getting out of hand", "Walked into a shop today and saw three teenagers just walk out with arms full of clothes, staff couldn't do anything.", "CrimeWatch", "Discussion")
+        ],
+        "robbery": [
+            ("Mugged at knifepoint in Hackney last night", "Was walking home late from the station. Two guys in balaclavas cornered me. Handed over my wallet and phone. Stay safe.", "london", "Crime"),
+            ("Attempted robbery near Camden Lock", "A guy tried to grab my bag, but I ran into a crowded pub. Police were called and they are searching the area.", "london", "Discussion"),
+            ("Store robbed in broad daylight in Croydon", "Two people entered the jewellery store and broke the display cases with hammers. Absolutely terrifying.", "CrimeWatch", "News"),
+            ("Increase in street robberies in our neighborhood", "We need more patrols around the park in the evening. There have been three muggings in the last two weeks.", "CrimeWatch", "Discussion")
+        ],
+        "burglary": [
+            ("Flat burgled in Islington - watch out for marked doors", "They took laptops, cameras, and some jewelry. We found a small blue chalk mark on our door frame, check yours!", "london", "Crime"),
+            ("House break-in while we were sleeping", "They got in through the back window. Thankfully no one was hurt but they took our car keys and stole the car.", "CrimeWatch", "Stolen"),
+            ("Suspects caught on ring camera checking front doors", "Last night around 3 AM, two guys walked up our driveway and tried the door handles. Shared footage with police.", "CrimeWatch", "Warning"),
+            ("Tips for securing your home against burglars?", "Moving into a ground floor flat soon and feeling a bit anxious. What are the best security locks or cameras to install?", "policeuk", "Question")
+        ],
+        "police": [
+            ("Shout out to the officers who helped me today", "Had my bag stolen but the local officers spotted the guy and got it back within 30 minutes. Really appreciate their help.", "policeuk", "Appreciation"),
+            ("Why is response time so slow for minor crimes?", "Reported a theft of a delivery parcel and was told no officer would be dispatched. Understand resources are tight though.", "policeuk", "Discussion"),
+            ("Police presence near London Bridge - what's happening?", "Lots of sirens and police cars blockading the road near the station. Anyone know what's going on?", "london", "Question"),
+            ("Great experience reporting a crime online", "Used the Metropolitan Police portal to report a minor collision and they followed up with CCTV footage requests very quickly.", "policeuk", "Feedback")
+        ],
+        "assault": [
+            ("Assaulted outside a pub in Shoreditch - police looking for witnesses", "Had a verbal disagreement that escalated. A group of guys attacked me. Police are reviewing CCTV, please contact if you saw it.", "london", "Crime"),
+            ("Unprovoked attack on bus route 73", "A teenager was shouting and punched a passenger before running off at the next stop. Hope they catch him soon.", "CrimeWatch", "News"),
+            ("Violent assault in suburban park during day", "A woman was grabbed while jogging. Passersby intervened and the suspect fled. Absolutely disgusting behavior.", "CrimeWatch", "News")
+        ],
+        "crime": [
+            ("Is London getting more dangerous or is it just social media?", "I feel like every second post is about a crime, but my day-to-day experience is mostly fine. What do you think?", "london", "Discussion"),
+            ("Weekly crime round-up for our borough", "Here are the crime statistics published by our council this week. Theft is up by 15%, but violent crime is down.", "CrimeWatch", "News"),
+            ("New anti-crime initiative launched in East London", "Community groups are teaming up with police to patrol high-risk areas and support youth programs.", "policeuk", "News")
+        ]
+    }
+    
+    random.seed(42)  # For reproducibility
+    now = datetime.now(timezone.utc)
+    authors = ["londoner_99", "cop_officer_2", "concerned_citizen", "uk_traveler", "crimewatcher_uk", "metro_rider", "islington_resident", "police_fan", "safety_first", "news_junkie"]
+    
+    for i in range(120):
+        # Pick a random category / search term
+        term = random.choice(list(templates.keys()))
+        t_list = templates[term]
+        title, body_base, sub, flair = random.choice(t_list)
+        
+        post_id = f"mock_{hashlib.md5(f'{title}_{i}'.encode()).hexdigest()[:6]}"
+        score = random.randint(5, 450)
+        upvote_ratio = round(random.uniform(0.65, 0.98), 2)
+        num_comments = int(score * random.uniform(0.1, 0.5)) + random.randint(1, 10)
+        author = random.choice(authors) + f"_{random.randint(10, 999)}"
+        
+        # Random created time in the last 60 days
+        days_ago = random.randint(0, 60)
+        hours_ago = random.randint(0, 23)
+        created_time = now - timedelta(days=days_ago, hours=hours_ago)
+        
+        post_data = {
+            "post_id":        post_id,
+            "title":          f"{title} [Batch {i}]" if random.random() < 0.1 else title,
+            "body":           f"{body_base}\n\nUpdate: Thanks for all the advice. I've reported it to the local station." if random.random() < 0.3 else body_base,
+            "subreddit":      sub,
+            "search_term":    term,
+            "score":          score,
+            "upvote_ratio":   upvote_ratio,
+            "num_comments":   num_comments,
+            "url":            f"https://reddit.com/r/{sub}/comments/{post_id}",
+            "permalink":      f"https://reddit.com/r/{sub}/comments/{post_id}",
+            "author":         author,
+            "created_utc":    created_time.isoformat(),
+            "flair":          flair,
+        }
+        
+        mock_posts.append({
+            "raw_data":            json.dumps(post_data),
+            "source":             "reddit",
+            "ingestion_timestamp": ingestion_ts,
+        })
+        
+    return mock_posts
+
+
+def main():
+    from dotenv import load_dotenv
+
+    load_dotenv()
+
+    logger.info("=" * 60)
+    logger.info("Social Media Bronze Ingestion — START")
+    ingestion_ts = datetime.now(timezone.utc).isoformat()
+    logger.info(f"Run timestamp: {ingestion_ts}")
+    logger.info("=" * 60)
+
+    # ── Authenticate Reddit API ───────────────────────────────────────────────
+    client_id     = os.getenv("REDDIT_CLIENT_ID")
+    client_secret = os.getenv("REDDIT_CLIENT_SECRET")
+    user_agent    = os.getenv("REDDIT_USER_AGENT", "CrimeIntelligenceBot/1.0")
+
+    all_records = []
+
+    if not client_id or not client_secret:
+        logger.warning(
+            "Reddit credentials missing in .env. Generating high-quality mock Reddit posts for demonstration..."
+        )
+        all_records = generate_mock_reddit_posts(ingestion_ts)
+    else:
+        import praw
+        reddit = praw.Reddit(
+            client_id=client_id,
+            client_secret=client_secret,
+            user_agent=user_agent,
+        )
+        logger.info(f"Reddit API authenticated (read-only={reddit.read_only})")
+
+        # ── Fetch posts ───────────────────────────────────────────────────────────
+        seen_ids    = set()
+
+        for subreddit_name in SUBREDDITS:
+            for term in SEARCH_TERMS:
+                posts = fetch_reddit_posts(reddit, subreddit_name, term, POST_LIMIT)
+                for post in posts:
+                    if post["post_id"] not in seen_ids:     # deduplicate within this batch
+                        seen_ids.add(post["post_id"])
+                        all_records.append({
+                            "raw_data":           json.dumps(post),
+                            "source":             SOURCE_NAME,
+                            "ingestion_timestamp": ingestion_ts,
+                        })
+                time.sleep(0.5)   # respect Reddit API rate limits
+
+    logger.info(f"\nTotal unique posts fetched/generated: {len(all_records):,}")
+
+    if not all_records:
+        logger.warning("No posts fetched. Check credentials and subreddit names.")
+        return
+
+    # ── Write to Bronze ───────────────────────────────────────────────────────
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    batch_id    = int(time.time())
+    output_file = os.path.join(OUTPUT_DIR, f"social_media_{batch_id}.json")
+
+    with open(output_file, "w", encoding="utf-8") as fh:
+        for record in all_records:
+            fh.write(json.dumps(record) + "\n")
+
+    logger.info("=" * 60)
+    logger.info("Social Media Bronze Ingestion — COMPLETE")
+    logger.info(f"  Output : {output_file}")
+    logger.info(f"  Records: {len(all_records):,}")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
