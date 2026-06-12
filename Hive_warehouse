@@ -1,0 +1,349 @@
+import os
+import json
+import logging
+from datetime import datetime, timezone
+
+import duckdb
+import pandas as pd
+import pyarrow.parquet as pq
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("HiveWarehouse")
+
+WAREHOUSE_VERSION = "1.0"
+DB_PATH           = "./data_lake/warehouse/crime_intelligence.duckdb"
+GOLD_DIR          = "./data_lake/gold/crime/"
+SILVER_TABLE      = "./data_lake/silver/crime/crime_silver_table"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DDL helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+DDL = {
+    # ── Dimension Tables ─────────────────────────────────────────────────────
+    "dim_date": """
+        CREATE OR REPLACE TABLE dim_date (
+            date_key     INTEGER PRIMARY KEY,   -- YYYYMM integer
+            month        VARCHAR,               -- "YYYY-MM"
+            year         INTEGER,
+            month_num    INTEGER,
+            quarter      INTEGER,
+            half_year    INTEGER,
+            month_label  VARCHAR                -- "October 2023"
+        );
+    """,
+
+    "dim_location": """
+        CREATE OR REPLACE TABLE dim_location (
+            location_key  INTEGER PRIMARY KEY,
+            street_name   VARCHAR,
+            latitude      DOUBLE,
+            longitude     DOUBLE,
+            hotspot_rank  INTEGER               -- from Gold crimes_by_street
+        );
+    """,
+
+    "dim_category": """
+        CREATE OR REPLACE TABLE dim_category (
+            category_key   INTEGER PRIMARY KEY,
+            category_slug  VARCHAR,             -- raw API slug e.g. "theft-from-the-person"
+            category_label VARCHAR,             -- human readable
+            category_group VARCHAR              -- Violence / Property / Public Order / Other
+        );
+    """,
+
+    "dim_outcome": """
+        CREATE OR REPLACE TABLE dim_outcome (
+            outcome_key      INTEGER PRIMARY KEY,
+            outcome_category VARCHAR,
+            is_resolved      BOOLEAN            -- TRUE if case has a definitive outcome
+        );
+    """,
+
+    "dim_source": """
+        CREATE OR REPLACE TABLE dim_source (
+            source_key  INTEGER PRIMARY KEY,
+            source_name VARCHAR,               -- "uk_police_api" | "social_media"
+            source_type VARCHAR                -- "structured" | "unstructured"
+        );
+    """,
+
+    # ── Fact Table ────────────────────────────────────────────────────────────
+    "fact_crimes": """
+        CREATE OR REPLACE TABLE fact_crimes (
+            fact_key      BIGINT PRIMARY KEY,
+            crime_id      BIGINT,
+            date_key      INTEGER REFERENCES dim_date(date_key),
+            location_key  INTEGER REFERENCES dim_location(location_key),
+            category_key  INTEGER REFERENCES dim_category(category_key),
+            outcome_key   INTEGER REFERENCES dim_outcome(outcome_key),
+            source_key    INTEGER REFERENCES dim_source(source_key),
+            crime_count   INTEGER DEFAULT 1,
+            is_resolved   BOOLEAN
+        );
+    """,
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Category metadata mapping
+# ─────────────────────────────────────────────────────────────────────────────
+
+CATEGORY_META = {
+    "theft-from-the-person":  ("Theft from the Person",  "Property Crime"),
+    "other-theft":            ("Other Theft",             "Property Crime"),
+    "shoplifting":            ("Shoplifting",             "Property Crime"),
+    "bicycle-theft":          ("Bicycle Theft",           "Property Crime"),
+    "vehicle-crime":          ("Vehicle Crime",           "Property Crime"),
+    "burglary":               ("Burglary",                "Property Crime"),
+    "robbery":                ("Robbery",                 "Property Crime"),
+    "violent-crime":          ("Violent Crime",           "Violent Crime"),
+    "possession-of-weapons":  ("Possession of Weapons",  "Violent Crime"),
+    "criminal-damage-arson":  ("Criminal Damage & Arson","Property Crime"),
+    "anti-social-behaviour":  ("Anti-Social Behaviour",  "Public Order"),
+    "public-order":           ("Public Order",            "Public Order"),
+    "drugs":                  ("Drugs",                   "Public Order"),
+    "other-crime":            ("Other Crime",             "Other"),
+}
+
+UNRESOLVED_OUTCOMES = {
+    "No outcome recorded",
+    "Investigation complete; no suspect identified",
+    "Status update unavailable",
+    "Awaiting court outcome",
+    "Action to be taken by another organisation",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Load helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_dim_date(con, df: pd.DataFrame):
+    months = df["month"].dropna().unique()
+    rows = []
+    for m in sorted(months):
+        try:
+            dt       = datetime.strptime(m, "%Y-%m")
+            date_key = int(m.replace("-", ""))
+            rows.append({
+                "date_key":    date_key,
+                "month":       m,
+                "year":        dt.year,
+                "month_num":   dt.month,
+                "quarter":     (dt.month - 1) // 3 + 1,
+                "half_year":   1 if dt.month <= 6 else 2,
+                "month_label": dt.strftime("%B %Y"),
+            })
+        except ValueError:
+            pass
+    dim = pd.DataFrame(rows)
+    con.execute("DELETE FROM dim_date")
+    con.execute("INSERT INTO dim_date SELECT * FROM dim")
+    logger.info(f"  dim_date       → {len(dim)} rows")
+    return {r["month"]: r["date_key"] for r in rows}
+
+
+def load_dim_location(con, df: pd.DataFrame):
+    # Use gold street table for hotspot_rank
+    street_path = os.path.join(GOLD_DIR, "crimes_by_street.parquet")
+    rank_map     = {}
+    if os.path.exists(street_path):
+        street_df = pd.read_parquet(street_path)[["street_name", "hotspot_rank"]]
+        rank_map  = dict(zip(street_df["street_name"], street_df["hotspot_rank"]))
+
+    loc = (
+        df[["street_name", "latitude", "longitude"]]
+        .drop_duplicates(subset=["street_name"])
+        .dropna(subset=["street_name"])
+        .reset_index(drop=True)
+    )
+    loc["location_key"] = loc.index + 1
+    loc["hotspot_rank"] = loc["street_name"].map(rank_map)
+    con.execute("DELETE FROM dim_location")
+    con.execute("INSERT INTO dim_location SELECT location_key, street_name, latitude, longitude, hotspot_rank FROM loc")
+    logger.info(f"  dim_location   → {len(loc)} rows")
+    return dict(zip(loc["street_name"], loc["location_key"]))
+
+
+def load_dim_category(con, df: pd.DataFrame):
+    categories = df["category"].dropna().unique()
+    rows = []
+    for i, slug in enumerate(sorted(categories), start=1):
+        label, group = CATEGORY_META.get(slug, (slug.replace("-", " ").title(), "Other"))
+        rows.append({
+            "category_key":   i,
+            "category_slug":  slug,
+            "category_label": label,
+            "category_group": group,
+        })
+    dim = pd.DataFrame(rows)
+    con.execute("DELETE FROM dim_category")
+    con.execute("INSERT INTO dim_category SELECT * FROM dim")
+    logger.info(f"  dim_category   → {len(dim)} rows")
+    return dict(zip(dim["category_slug"], dim["category_key"]))
+
+
+def load_dim_outcome(con, df: pd.DataFrame):
+    outcomes = df["outcome_category"].fillna("No outcome recorded").unique()
+    rows = []
+    for i, oc in enumerate(sorted(outcomes), start=1):
+        rows.append({
+            "outcome_key":      i,
+            "outcome_category": oc,
+            "is_resolved":      oc not in UNRESOLVED_OUTCOMES,
+        })
+    dim = pd.DataFrame(rows)
+    con.execute("DELETE FROM dim_outcome")
+    con.execute("INSERT INTO dim_outcome SELECT * FROM dim")
+    logger.info(f"  dim_outcome    → {len(dim)} rows")
+    return dict(zip(dim["outcome_category"], dim["outcome_key"]))
+
+
+def load_dim_source(con):
+    rows = [
+        {"source_key": 1, "source_name": "uk_police_api", "source_type": "structured"},
+        {"source_key": 2, "source_name": "social_media",  "source_type": "unstructured"},
+    ]
+    dim = pd.DataFrame(rows)
+    con.execute("DELETE FROM dim_source")
+    con.execute("INSERT INTO dim_source SELECT * FROM dim")
+    logger.info(f"  dim_source     → {len(dim)} rows")
+
+
+def load_fact_crimes(con, df: pd.DataFrame,
+                     date_map, loc_map, cat_map, out_map):
+    fact = df.copy()
+
+    # Resolve foreign keys
+    fact["date_key"]     = fact["month"].map(date_map).fillna(0).astype(int)
+    fact["location_key"] = fact["street_name"].map(loc_map).fillna(0).astype(int)
+    fact["category_key"] = fact["category"].map(cat_map).fillna(0).astype(int)
+
+    oc_filled            = fact["outcome_category"].fillna("No outcome recorded")
+    fact["outcome_key"]  = oc_filled.map(out_map).fillna(0).astype(int)
+    fact["source_key"]   = 1           # uk_police_api
+    fact["crime_count"]  = 1
+    fact["is_resolved"]  = oc_filled.map(lambda x: x not in UNRESOLVED_OUTCOMES)
+    fact["fact_key"]     = range(1, len(fact) + 1)
+
+    fact_out = fact[[
+        "fact_key", "crime_id", "date_key", "location_key",
+        "category_key", "outcome_key", "source_key", "crime_count", "is_resolved"
+    ]].copy()
+    fact_out["crime_id"] = pd.to_numeric(fact_out["crime_id"], errors="coerce").astype("Int64")
+
+    con.execute("DELETE FROM fact_crimes")
+    con.execute("INSERT INTO fact_crimes SELECT * FROM fact_out")
+    logger.info(f"  fact_crimes    → {len(fact_out):,} rows")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    run_ts = datetime.now(timezone.utc).isoformat()
+    logger.info("=" * 60)
+    logger.info("Hive Warehouse (DuckDB Star Schema) — START")
+    logger.info(f"Run timestamp   : {run_ts}")
+    logger.info(f"Warehouse path  : {DB_PATH}")
+    logger.info("=" * 60)
+
+    # ── Validate Silver source ────────────────────────────────────────────────
+    if not os.path.exists(SILVER_TABLE):
+        logger.error(f"Silver table not found: {SILVER_TABLE}. Run silver_layer.py first.")
+        return
+
+    # ── Load Silver data ──────────────────────────────────────────────────────
+    logger.info(f"Loading Silver table: {SILVER_TABLE}")
+    df = pq.read_table(SILVER_TABLE).to_pandas()
+    logger.info(f"Silver rows loaded : {len(df):,}")
+
+    # ── Connect / create DuckDB warehouse ─────────────────────────────────────
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = duckdb.connect(DB_PATH)
+
+    # ── Drop existing tables (CASCADE to handle FK deps) ──────────────────────
+    logger.info("\nDropping existing tables (if any)...")
+    drop_order = ["fact_crimes", "dim_date", "dim_location", "dim_category", "dim_outcome", "dim_source"]
+    for table_name in drop_order:
+        con.execute(f"DROP TABLE IF EXISTS {table_name} CASCADE")
+
+    # ── Create schema ─────────────────────────────────────────────────────────
+    logger.info("Creating star schema tables...")
+    for table_name, ddl in DDL.items():
+        con.execute(ddl)
+        logger.info(f"  ✓ {table_name}")
+
+    # ── Populate dimensions then fact ─────────────────────────────────────────
+    logger.info("\nLoading dimension tables...")
+    date_map = load_dim_date(con, df)
+    loc_map  = load_dim_location(con, df)
+    cat_map  = load_dim_category(con, df)
+    out_map  = load_dim_outcome(con, df)
+    load_dim_source(con)
+
+    logger.info("\nLoading fact table...")
+    load_fact_crimes(con, df, date_map, loc_map, cat_map, out_map)
+
+    # ── Verification queries ──────────────────────────────────────────────────
+    logger.info("\nWarehouse verification queries:")
+
+    result = con.execute("""
+        SELECT dc.category_label, SUM(f.crime_count) AS total_crimes
+        FROM   fact_crimes f
+        JOIN   dim_category dc ON f.category_key = dc.category_key
+        GROUP  BY dc.category_label
+        ORDER  BY total_crimes DESC
+        LIMIT  5
+    """).fetchdf()
+    logger.info(f"\n  Top 5 categories:\n{result.to_string(index=False)}")
+
+    result2 = con.execute("""
+        SELECT dout.outcome_category,
+               SUM(f.crime_count)                          AS total,
+               ROUND(AVG(f.is_resolved::INTEGER) * 100, 1) AS resolution_pct
+        FROM   fact_crimes f
+        JOIN   dim_outcome dout ON f.outcome_key = dout.outcome_key
+        GROUP  BY dout.outcome_category
+        ORDER  BY total DESC
+        LIMIT  5
+    """).fetchdf()
+    logger.info(f"\n  Top 5 outcomes:\n{result2.to_string(index=False)}")
+
+    # ── Write metadata ────────────────────────────────────────────────────────
+    tables_info = {}
+    for t in ["dim_date", "dim_location", "dim_category", "dim_outcome", "dim_source", "fact_crimes"]:
+        n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        tables_info[t] = n
+
+    meta_path = "./data_lake/warehouse/warehouse_run_metadata.json"
+    with open(meta_path, "w", encoding="utf-8") as mf:
+        json.dump({
+            "warehouse_version": WAREHOUSE_VERSION,
+            "run_timestamp":     run_ts,
+            "silver_source":     SILVER_TABLE,
+            "db_path":           DB_PATH,
+            "tables":            tables_info,
+        }, mf, indent=2)
+
+    con.close()
+
+    logger.info("=" * 60)
+    logger.info("Hive Warehouse (DuckDB Star Schema) — COMPLETE")
+    for t, n in tables_info.items():
+        logger.info(f"  {t:<20} {n:>6,} rows")
+    logger.info(f"  Warehouse DB   : {DB_PATH}")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
