@@ -1,0 +1,260 @@
+import os
+import json
+import logging
+import hashlib
+from datetime import datetime, timezone
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("SocialMediaSilver")
+
+SILVER_VERSION = "1.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Explicit PyArrow Schema for the Social Media Silver Parquet Table
+# ─────────────────────────────────────────────────────────────────────────────
+SOCIAL_MEDIA_SILVER_SCHEMA = pa.schema([
+    pa.field("post_id",                   pa.string(),   nullable=False),
+    pa.field("title",                     pa.string(),   nullable=False),
+    pa.field("body",                      pa.string(),   nullable=True),
+    pa.field("subreddit",                 pa.string(),   nullable=False),
+    pa.field("search_term",               pa.string(),   nullable=True),
+    pa.field("score",                     pa.int64(),    nullable=False),
+    pa.field("upvote_ratio",              pa.float64(),  nullable=False),
+    pa.field("num_comments",              pa.int64(),    nullable=False),
+    pa.field("url",                       pa.string(),   nullable=True),
+    pa.field("permalink",                 pa.string(),   nullable=True),
+    pa.field("author",                    pa.string(),   nullable=True),
+    pa.field("created_utc",               pa.string(),   nullable=False),
+    pa.field("flair",                     pa.string(),   nullable=True),
+    pa.field("sentiment_polarity",        pa.float64(),  nullable=False),
+    pa.field("sentiment_label",           pa.string(),   nullable=False),
+    pa.field("bronze_ingestion_timestamp",pa.string(),   nullable=True),
+    pa.field("silver_processed_at",       pa.string(),   nullable=False),
+    pa.field("silver_version",            pa.string(),   nullable=False),
+    pa.field("partition_subreddit",       pa.string(),   nullable=True),
+])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lexicon-based Sentiment Analyzer (Fallback if TextBlob is not available/offline)
+# ─────────────────────────────────────────────────────────────────────────────
+class LocalSentimentAnalyzer:
+    def __init__(self):
+        # Crime-related and general sentiment indicators
+        self.positive_words = {
+            'safe', 'secured', 'resolved', 'peaceful', 'calm', 'improved', 'helpful', 'helping',
+            'support', 'good', 'excellent', 'great', 'positive', 'protected', 'justice',
+            'recovered', 'found', 'rescued', 'cooperating', 'cooperation', 'thank', 'thanks',
+            'praise', 'nice', 'kind', 'happy', 'hero', 'heroes', 'solved', 'solves', 'solid'
+        }
+        self.negative_words = {
+            'crime', 'theft', 'robbery', 'assault', 'burglary', 'stolen', 'shot', 'killed',
+            'attack', 'attacks', 'violence', 'violent', 'dangerous', 'danger', 'scared',
+            'afraid', 'suspicious', 'weapon', 'gun', 'knife', 'murder', 'break-in', 'broke',
+            'arrested', 'suspect', 'threat', 'terror', 'drugs', 'illegal', 'fear', 'homicide',
+            'mugged', 'mugging', 'snatched', 'grabbed', 'awful', 'terrible', 'scary', 'worry',
+            'concerned', 'anxious', 'stole', 'stolen', 'thief', 'thieves', 'bad', 'horrible'
+        }
+        
+    def analyze(self, text: str) -> float:
+        """Returns a sentiment polarity score between -1.0 (negative) and 1.0 (positive)"""
+        if not text:
+            return 0.0
+        words = text.lower().replace('.', ' ').replace(',', ' ').replace('!', ' ').replace('?', ' ').split()
+        if not words:
+            return 0.0
+        pos_count = sum(1 for w in words if w in self.positive_words)
+        neg_count = sum(1 for w in words if w in self.negative_words)
+        total = pos_count + neg_count
+        if total == 0:
+            return 0.0
+        return (pos_count - neg_count) / total
+
+# Try to import TextBlob, fallback to LocalSentimentAnalyzer
+try:
+    from textblob import TextBlob
+    def get_sentiment_score(text: str) -> float:
+        if not text:
+            return 0.0
+        return float(TextBlob(text).sentiment.polarity)
+except ImportError:
+    analyzer = LocalSentimentAnalyzer()
+    def get_sentiment_score(text: str) -> float:
+        return analyzer.analyze(text)
+
+def get_sentiment_label(score: float) -> str:
+    if score > 0.05:
+        return "Positive"
+    elif score < -0.05:
+        return "Negative"
+    else:
+        return "Neutral"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parsing logic
+# ─────────────────────────────────────────────────────────────────────────────
+def parse_social_media_record(raw_data_str: str, ingestion_ts: str, silver_ts: str) -> dict | None:
+    try:
+        data = json.loads(raw_data_str)
+        
+        post_id = str(data.get("post_id"))
+        title = str(data.get("title", ""))
+        body = str(data.get("body", ""))
+        
+        # Combine title and body for a richer sentiment context
+        full_text = f"{title} {body}".strip()
+        sentiment_val = get_sentiment_score(full_text)
+        sentiment_lbl = get_sentiment_label(sentiment_val)
+        
+        record = {
+            "post_id":                    post_id,
+            "title":                      title,
+            "body":                       body if body else None,
+            "subreddit":                  str(data.get("subreddit", "unknown")),
+            "search_term":                str(data.get("search_term", "unknown")),
+            "score":                      int(data.get("score", 0)),
+            "upvote_ratio":               float(data.get("upvote_ratio", 1.0)),
+            "num_comments":               int(data.get("num_comments", 0)),
+            "url":                        data.get("url"),
+            "permalink":                  data.get("permalink"),
+            "author":                     data.get("author"),
+            "created_utc":                str(data.get("created_utc")),
+            "flair":                      data.get("flair"),
+            "sentiment_polarity":        sentiment_val,
+            "sentiment_label":           sentiment_lbl,
+            "bronze_ingestion_timestamp": ingestion_ts,
+            "silver_processed_at":        silver_ts,
+            "silver_version":             SILVER_VERSION,
+            "partition_subreddit":        str(data.get("subreddit", "unknown")),
+        }
+        return record
+    except Exception as exc:
+        logger.warning(f"Failed to parse social media record: {exc}")
+        return None
+
+def main():
+    silver_ts = datetime.now(timezone.utc).isoformat()
+    logger.info("=" * 60)
+    logger.info("Social Media Silver Transformation — START")
+    logger.info(f"Run timestamp : {silver_ts}")
+    logger.info(f"Schema version: {SILVER_VERSION}")
+    logger.info("=" * 60)
+
+    bronze_dir = "./data_lake/bronze/social_media/"
+    silver_dir = "./data_lake/silver/social_media/"
+
+    # Validate inputs
+    if not os.path.exists(bronze_dir):
+        logger.error(f"Bronze social media directory not found: {bronze_dir}. Run social_media_bronze.py first.")
+        return
+
+    bronze_files = [f for f in os.listdir(bronze_dir) if f.endswith(".json")]
+    if not bronze_files:
+        logger.warning("No JSON files found in Bronze social media layer. Nothing to process.")
+        return
+
+    logger.info(f"Found {len(bronze_files)} Bronze social media file(s) to process.")
+
+    all_records = []
+    parse_errors = 0
+
+    for filename in sorted(bronze_files):
+        file_path = os.path.join(bronze_dir, filename)
+        logger.info(f"  Reading: {file_path}")
+        file_errors = 0
+
+        with open(file_path, "r", encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    wrapper = json.loads(line)
+                    raw_data_str = wrapper.get("raw_data")
+                    ingestion_ts = wrapper.get("ingestion_timestamp", "")
+
+                    if not raw_data_str:
+                        file_errors += 1
+                        continue
+
+                    record = parse_social_media_record(raw_data_str, ingestion_ts, silver_ts)
+                    if record:
+                        all_records.append(record)
+                    else:
+                        file_errors += 1
+
+                except json.JSONDecodeError as exc:
+                    logger.debug(f"    Line {line_no} JSON error: {exc}")
+                    file_errors += 1
+
+        parse_errors += file_errors
+        logger.info(f"    → parsed {len(all_records)} total records so far ({file_errors} errors in this file)")
+
+    if not all_records:
+        logger.warning("No valid records parsed from Bronze social media layer. Aborting.")
+        return
+
+    df = pd.DataFrame(all_records)
+    logger.info(f"Total raw records loaded: {len(df):,}")
+
+    # Deduplicate on post_id
+    before_dedup = len(df)
+    df_clean = df.drop_duplicates(subset=["post_id"]).reset_index(drop=True)
+    dedup_dropped = before_dedup - len(df_clean)
+    logger.info(f"Dropped duplicates    : {dedup_dropped:,}")
+    logger.info(f"Final clean record count: {len(df_clean):,}")
+
+    # Write partitioned Parquet table
+    os.makedirs(silver_dir, exist_ok=True)
+    
+    try:
+        table = pa.Table.from_pandas(df_clean, schema=SOCIAL_MEDIA_SILVER_SCHEMA, preserve_index=False)
+    except pa.ArrowInvalid as exc:
+        logger.warning(f"Schema cast failed: {exc}. Using inferred schema.")
+        table = pa.Table.from_pandas(df_clean, preserve_index=False)
+
+    output_path = os.path.join(silver_dir, "social_media_silver_table")
+    logger.info(f"Writing partitioned Parquet table to: {output_path}")
+
+    pq.write_to_dataset(
+        table,
+        root_path=output_path,
+        partition_cols=["partition_subreddit"],
+        compression="snappy",
+        existing_data_behavior="overwrite_or_ignore",
+    )
+
+    # Write run metadata
+    metadata = {
+        "silver_version":      SILVER_VERSION,
+        "run_timestamp":       silver_ts,
+        "bronze_files":        bronze_files,
+        "total_bronze_rows":   len(all_records),
+        "dedup_dropped":       dedup_dropped,
+        "parse_errors":        parse_errors,
+        "final_row_count":     len(df_clean),
+        "partitioned_by":      "partition_subreddit",
+        "compression":         "snappy",
+    }
+    meta_path = os.path.join(silver_dir, "social_media_silver_metadata.json")
+    with open(meta_path, "w", encoding="utf-8") as mf:
+        json.dump(metadata, mf, indent=2)
+
+    logger.info("=" * 60)
+    logger.info("Social Media Silver Transformation — COMPLETE")
+    logger.info(f"  Parquet table : {output_path}/")
+    logger.info(f"  Run metadata  : {meta_path}")
+    logger.info(f"  Final rows    : {len(df_clean):,}")
+    logger.info("=" * 60)
+
+if __name__ == "__main__":
+    main()
