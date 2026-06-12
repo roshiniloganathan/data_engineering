@@ -1,0 +1,17 @@
+python : 2026-04-18 15:00:20,698 - BronzeIngestion - INFO - Starting Python-based Data Ingestion 
+(bypassing PySpark due to Python 3.13 incompatibility).
+At line:1 char:1
++ python bronze_layer.py > output.log 2>&1
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (2026-04-18 15:0...compatibility).:String) [], RemoteExc 
+   eption
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+2026-04-18 15:00:20,698 - BronzeIngestion - INFO - Attempt 1: Fetching data from 
+https://data.police.uk/api/crimes-street/all-crime
+2026-04-18 15:00:30,033 - BronzeIngestion - INFO - Data fetched successfully.
+2026-04-18 15:00:30,108 - BronzeIngestion - INFO - Fetched 6512 records from API.
+2026-04-18 15:00:30,162 - BronzeIngestion - INFO - Writing data to local path: 
+./data_lake/bronze/crime/crime_data_1776504630.json
+2026-04-18 15:00:30,214 - BronzeIngestion - INFO - Data successfully written to Bronze layer in 
+JSONL format.
