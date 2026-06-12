@@ -1,0 +1,17 @@
+import pandas as pd
+
+tables = [
+    "crimes_by_category",
+    "crimes_by_outcome",
+    "crimes_by_category_month",
+    "crimes_by_street",
+]
+
+for t in tables:
+    path = f"./data_lake/gold/crime/{t}.parquet"
+    df = pd.read_parquet(path)
+    drop_cols = [c for c in ["gold_version", "gold_processed_at"] if c in df.columns]
+    print(f"\n{'='*70}")
+    print(f"  TABLE: {t}  ({len(df)} rows x {len(df.columns)} cols)")
+    print(f"{'='*70}")
+    print(df.drop(columns=drop_cols).to_string(index=False))
