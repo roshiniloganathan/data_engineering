@@ -1,0 +1,119 @@
+import os
+import sys
+import time
+import requests
+import logging
+import json
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+
+# Set HADOOP_HOME to use the downloaded winutils for Windows
+os.environ["HADOOP_HOME"] = os.path.join(os.getcwd(), "hadoop")
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("BronzeIngestion")
+
+def fetch_data_with_retry(url, params=None, headers=None, max_retries=3, backoff_factor=2):
+    """
+    Fetch data from an external API using HTTP requests with fault-tolerant retry logic.
+    Supports authentication via headers.
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempt {attempt + 1}: Fetching data from {url}")
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+            
+            # Raise an exception for HTTP errors (4xx or 5xx) to trigger the retry logic
+            response.raise_for_status()
+            
+            logger.info("Data fetched successfully.")
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching data on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                sleep_time = backoff_factor ** attempt
+                logger.info(f"Temporary network or API issue detected. Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+            else:
+                logger.error("Max retries reached. Failing the ingestion process.")
+                raise
+
+def main():
+    # Load environment variables from .env file
+    load_dotenv()
+    
+    logger.info("Starting Python-based Data Ingestion (bypassing PySpark due to Python 3.13 incompatibility).")
+
+    # UK Police API endpoint 
+    # Example fetching all crimes at a specific location for batch processing
+    api_url = "https://data.police.uk/api/crimes-street/all-crime"
+    api_params = {
+        "lat": 51.5074,  # Example: London
+        "lng": -0.1278,
+        "date": "2023-10" # Example batch date
+    }
+    
+    # Support for authentication using an API key via headers
+    api_key = os.getenv("CRIME_API_KEY", "AIzaSyBH7fjscWtue1So2L5RHyH1L9DcSk4H5eY")
+    api_headers = {
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    # 1. Fetch Data
+    try:
+        raw_crime_data = fetch_data_with_retry(
+            url=api_url, 
+            params=api_params, 
+            headers=api_headers,
+            max_retries=3
+        )
+    except Exception as e:
+        logger.error("Ingestion pipeline failed during API fetch phase.")
+        return
+
+    if not raw_crime_data:
+        logger.warning("API returned an empty dataset. Exiting pipeline without writing.")
+        return
+
+    logger.info(f"Fetched {len(raw_crime_data)} records from API.")
+
+    # 2. Append an ingestion timestamp to each record and prepare for saving
+    current_time = datetime.now(timezone.utc).isoformat()
+    processed_records = []
+    
+    for record in raw_crime_data:
+        processed_records.append({
+            "raw_data": json.dumps(record),
+            "ingestion_timestamp": current_time
+        })
+        
+    # 3. Store the data in local directory under the Bronze layer path
+    output_dir = "./data_lake/bronze/crime/"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create a unique filename for this batch
+    batch_id = int(time.time())
+    output_file = os.path.join(output_dir, f"crime_data_{batch_id}.json")
+    
+    logger.info(f"Writing data to local path: {output_file}")
+    try:
+        # Write as newline-delimited JSON (JSONL) to mimic Spark's output format
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for record in processed_records:
+                f.write(json.dumps(record) + "\n")
+                
+        logger.info("Data successfully written to Bronze layer in JSONL format.")
+    except Exception as e:
+        logger.error(f"Failed to write data: {e}")
+
+if __name__ == "__main__":
+    main()
+ 
