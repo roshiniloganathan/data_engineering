@@ -1,0 +1,16 @@
+Crime Data Sources
+       ↓
+Data Factory
+       ↓
+Bronze Layer
+(Raw Data)
+       ↓
+Silver Layer
+(Cleaned Data)
+       ↓
+Gold Layer
+(Aggregated Data)
+       ↓
+Power BI Dashboard
+       ↓
+AI Chatbot (RAG)
