@@ -1,22 +1,33 @@
-Data Collection
+ETL Pipeline Tools
 
-Crime dataset from open government portals or Kaggle
 
-Data Processing
+Bronze Layer
 
-Python
+Requests
+PRAW
+JSONL
+Logging
+Retry Mechanism
+
+
+Silver Layer
+
 Pandas
-NumPy
+PyArrow
+SHA-256 Hashing
+TextBlob
+Parquet
 
-Database
 
-MySQL / PostgreSQL
+Gold Layer
 
-Data Analysis
+Pandas
+DuckDB
+Parquet
 
-SQL
-Python
 
-Visualization
+Presentation Layer
 
-Power BI
+Streamlit
+Plotly
+PyDeck
